@@ -305,3 +305,56 @@ class RcloneUploadCallback(TrainCallback):
             self.logger.error("rclone command not found. Please install rclone: https://rclone.org/install/")
         except Exception as e:
             self.logger.error(f"Error during rclone upload: {e}")
+
+
+@TrainCallback.register("microbert2.microbert.model.model::huggingface_upload")
+class HuggingFaceUploadCallback(TrainCallback):
+    """
+    Callback to push the saved model to the HuggingFace Hub after training.
+    Depends on WriteModelCallback having run first (reads last_saved_model_path).
+    """
+
+    def __init__(
+        self,
+        repo_id: str,
+        token: Optional[str] = None,
+        private: bool = False,
+        commit_message: str = "Upload model via microbert2",
+        *args,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self.repo_id = repo_id
+        self.token = token
+        self.private = private
+        self.commit_message = commit_message
+
+    def post_train_loop(self, step: int, epoch: int) -> None:
+        if not self.train_config.is_local_main_process:
+            return
+
+        if not (WriteModelCallback.last_saved_model_path and WriteModelCallback.last_saved_model_path.exists()):
+            self.logger.warning("HuggingFaceUploadCallback: no model saved by WriteModelCallback, skipping upload.")
+            return
+
+        try:
+            from huggingface_hub import HfApi
+        except ImportError:
+            self.logger.error("huggingface_hub is not installed. Run: pip install huggingface-hub")
+            return
+
+        token = self.token or os.environ.get("HF_TOKEN")
+        model_path = WriteModelCallback.last_saved_model_path
+
+        self.logger.info(f"Uploading {model_path} to HuggingFace Hub repo '{self.repo_id}'")
+        try:
+            api = HfApi(token=token)
+            api.create_repo(repo_id=self.repo_id, private=self.private, exist_ok=True)
+            api.upload_folder(
+                folder_path=str(model_path),
+                repo_id=self.repo_id,
+                commit_message=self.commit_message,
+            )
+            self.logger.info(f"Successfully uploaded model to https://huggingface.co/{self.repo_id}")
+        except Exception as e:
+            self.logger.error(f"Error uploading to HuggingFace Hub: {e}")
