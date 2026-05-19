@@ -85,6 +85,43 @@ class SubwordTokenize(Step):
         offsets = [(0, 0)] + offsets + [(offsets[-1][1] + 1,) * 2]
         return wp_ids, offsets, truncated
 
+    def intra_word_tokenize_pair(
+        self,
+        src_tokens: List[str],
+        tgt_tokens: List[str],
+        tokenizer: Tokenizer,
+        max_wordpieces: int,
+    ) -> Tuple[List[int], List[int], List[Optional[Tuple[int, int]]], bool]:
+        """
+        Tokenize a parallel pair as [CLS] src [SEP] tgt [SEP].
+        Returns (input_ids, token_type_ids, token_spans, truncated).
+        token_type_ids is 0 for the [CLS]+src+[SEP] side and 1 for tgt+[SEP].
+        """
+        budget = max_wordpieces - 3  # [CLS], [SEP], [SEP]
+        src_budget = budget // 2
+        tgt_budget = budget - src_budget
+
+        src_wp, src_offsets, src_trunc = self._intra_word_tokenize(src_tokens, tokenizer, src_budget)
+        tgt_wp, tgt_offsets, tgt_trunc = self._intra_word_tokenize(tgt_tokens, tokenizer, tgt_budget)
+
+        cls_id = tokenizer.cls_token_id
+        sep_id = tokenizer.sep_token_id
+
+        input_ids = [cls_id] + src_wp + [sep_id] + tgt_wp + [sep_id]
+        token_type_ids = [0] * (1 + len(src_wp) + 1) + [1] * (len(tgt_wp) + 1)
+
+        src_sep_pos = 1 + len(src_wp)
+        tgt_sep_pos = src_sep_pos + 1 + len(tgt_wp)
+        token_spans = (
+            [(0, 0)]
+            + self._increment_offsets(src_offsets, 1)
+            + [(src_sep_pos, src_sep_pos)]
+            + self._increment_offsets(tgt_offsets, src_sep_pos + 1)
+            + [(tgt_sep_pos, tgt_sep_pos)]
+        )
+
+        return input_ids, token_type_ids, token_spans, src_trunc or tgt_trunc
+
     def _process_split(
         self,
         split: list,
@@ -105,7 +142,13 @@ class SubwordTokenize(Step):
             nonlocal wp_count, sentence_count, token_count
             for d in Tqdm.tqdm(split, desc=f"Tokenizing {task_slug} ({split_name})"):
                 sentence = d["tokens"]
-                wp_ids, token_spans, truncated = self.intra_word_tokenize(sentence, tokenizer, max_length)
+                if "target_tokens" in d:
+                    wp_ids, token_type_ids, token_spans, truncated = self.intra_word_tokenize_pair(
+                        sentence, d["target_tokens"], tokenizer, max_length
+                    )
+                else:
+                    wp_ids, token_spans, truncated = self.intra_word_tokenize(sentence, tokenizer, max_length)
+                    token_type_ids = [0] * len(wp_ids)
                 flattened = []
                 for pair in token_spans:
                     flattened.extend(pair)
@@ -113,10 +156,8 @@ class SubwordTokenize(Step):
                     **d,
                     "input_ids": wp_ids,
                     "token_spans": flattened,
-                    # I don't think we need this?
-                    # "tokens": sentence[: len(token_spans) - 2],
                     "attention_mask": [1] * len(wp_ids),
-                    "token_type_ids": [0] * len(wp_ids),
+                    "token_type_ids": token_type_ids,
                 }
                 wp_count += len(wp_ids)
                 sentence_count += 1
@@ -176,7 +217,9 @@ class TrainTokenizer(Step):
         tokens = [" ".join("None" if t is None else str(t) for t in s) for s in sentences]
         for task in tasks:
             for sentence in task.dataset["train"]:
-                tokens.append(" ".join("None" if t is None else str(t) for t in sentence.get("tokens",[])))
+                tokens.append(" ".join("None" if t is None else str(t) for t in sentence.get("tokens", [])))
+                if "target_tokens" in sentence:
+                    tokens.append(" ".join("None" if t is None else str(t) for t in sentence["target_tokens"]))
         tokenizer = train_tokenizer(
             tokens,
             model_path,

@@ -1,9 +1,105 @@
+import csv
 from typing import Optional
 
 import more_itertools as mit
 import stanza
 from tango import DillFormat, Step
 from tango.common import Tqdm
+
+
+@Step.register("microbert2.data.text::read_parallel_text")
+class ReadParallelText(Step):
+    """
+    Reads whitespace-tokenized parallel text from two aligned files and returns
+    a dict with train/dev/test splits. Each instance has "tokens" (source /
+    low-resource language) and "target_tokens" (target / high-resource language).
+    """
+
+    DETERMINISTIC = True
+    CACHEABLE = True
+    FORMAT = DillFormat()
+
+    def run(
+        self,
+        train_src_path: str,
+        train_tgt_path: str,
+        dev_src_path: str,
+        dev_tgt_path: str,
+        test_src_path: Optional[str] = None,
+        test_tgt_path: Optional[str] = None,
+    ) -> dict:
+        def read_pair(src_path, tgt_path):
+            pairs = []
+            with open(src_path, "r") as sf, open(tgt_path, "r") as tf:
+                for src_line, tgt_line in zip(sf, tf):
+                    src_tokens = [t for t in src_line.strip().split() if t]
+                    tgt_tokens = [t for t in tgt_line.strip().split() if t]
+                    if src_tokens and tgt_tokens:
+                        pairs.append({"tokens": src_tokens, "target_tokens": tgt_tokens})
+            return pairs
+
+        splits = {
+            "train": read_pair(train_src_path, train_tgt_path),
+            "dev": read_pair(dev_src_path, dev_tgt_path),
+        }
+        if test_src_path and test_tgt_path:
+            splits["test"] = read_pair(test_src_path, test_tgt_path)
+        else:
+            splits["test"] = []
+
+        for split, data in splits.items():
+            self.logger.info(
+                f"Read {len(data)} {split} sentence pairs "
+                f"({sum(len(d['tokens']) for d in data)} src tokens, "
+                f"{sum(len(d['target_tokens']) for d in data)} tgt tokens)"
+            )
+        return splits
+
+
+@Step.register("microbert2.data.text::read_parallel_tsv")
+class ReadParallelTsv(Step):
+    """
+    Reads parallel data from a tab-separated file (src\\ttgt per line) and returns
+    a dict with train/dev/test splits. Each instance has "tokens" (source /
+    low-resource language) and "target_tokens" (target / high-resource language).
+    Reuses the same tsv files as the MT tasks.
+    """
+
+    DETERMINISTIC = True
+    CACHEABLE = True
+    FORMAT = DillFormat()
+
+    def run(
+        self,
+        train_path: str,
+        dev_path: str,
+        test_path: Optional[str] = None,
+        delimiter: str = "\t",
+    ) -> dict:
+        def read_tsv(path):
+            pairs = []
+            with open(path, "r", encoding="utf-8") as f:
+                for row in csv.reader(f, delimiter=delimiter):
+                    if len(row) < 2:
+                        continue
+                    src = [t for t in row[0].strip().split() if t]
+                    tgt = [t for t in row[1].strip().split() if t]
+                    if src and tgt:
+                        pairs.append({"tokens": src, "target_tokens": tgt})
+            return pairs
+
+        splits = {
+            "train": read_tsv(train_path),
+            "dev": read_tsv(dev_path),
+            "test": read_tsv(test_path) if test_path else [],
+        }
+        for split, data in splits.items():
+            self.logger.info(
+                f"Read {len(data)} {split} sentence pairs "
+                f"({sum(len(d['tokens']) for d in data)} src tokens, "
+                f"{sum(len(d['target_tokens']) for d in data)} tgt tokens)"
+            )
+        return splits
 
 
 def initialize_stanza_pipeline(stanza_retokenize, stanza_use_mwt, stanza_language_code):
